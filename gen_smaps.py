@@ -5,7 +5,6 @@ from obj.FSLViewer import FSLViewer
 from obj.Smap import Smaps
 from obj.pblms import PBNuSense, PBNuSenseGram
 from obj.helpers import *
-from copy import deepcopy
 import torch
 
 # Flags
