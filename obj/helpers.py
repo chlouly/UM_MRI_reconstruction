@@ -4,6 +4,7 @@ from scipy.io import loadmat
 import time
 import gc
 from mirtorch.alg import CG
+import functools
 
 def clr_mem():
     gc.collect()
@@ -30,7 +31,23 @@ def synchronize(device):
         torch.cuda.synchronize()
     elif device.type == "mps":
         torch.mps.synchronize()
-        
+
+def synchronize_dec(device):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            result = func(*args, **kwargs)
+
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            elif device.type == "mps":
+                torch.mps.synchronize()
+
+            return result
+
+        return wrapper
+    return decorator
+
 def timed(function, device):
     synchronize(device)
     start = time.perf_counter()
@@ -47,7 +64,7 @@ def print_soln(x, t, res_scl=1.0, pref=""):
 
     print(f"[ {x.iterations} its , {t:.2f} s , |res| = {(x.residual_norm.item() / res_scl):.2e} , VRAM aloc {(torch.cuda.memory_allocated()/(1024 ** 3)):.4f} GiB ]")
 
-def recon_cg(y, w, A, AhA, R, reg, device, max_iter):
+def CGSENSE(y, w, A, AhA, R, reg, device, max_iter):
     AHy = A.H * y.to(device)
     AHyw = A.H * (y.to(device) * w.to(device))
 

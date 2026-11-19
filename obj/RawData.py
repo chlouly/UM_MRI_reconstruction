@@ -23,6 +23,7 @@ from copy import deepcopy
 from GERecon import Pfile
 from obj.helpers import *
 from obj.pblms import PBNuSenseGram
+from obj.nufft import NuFFT, NuFFTGram
 
 # TODO:
 #   - Handle Cases when KTraj Is the same from frame to frame
@@ -88,13 +89,13 @@ class RawData:
     _data_type = torch.complex64    # dtype of Kspace Data
     _traj_type = torch.float32      # dtype of Kspace Trajectory
     _fov_type = torch.float32       # dtype of Image Field of View
-    _matsize_type = torch.uint16    # dtype of Image Matrix Dimensions
+    _matsize_type = torch.int32    # dtype of Image Matrix Dimensions
 
     #####################################################################################
     #   Initialization and Data Loading                                                 #
     #####################################################################################
 
-    def __init__(self, data: Tensor, traj: Tensor, fov: Tensor, matsize: Tensor, device: Device = "cpu", dir: Path | None = None, samp_dim: int = 0, spat_dim: int = 3):
+    def __init__(self, data: Tensor, traj: Tensor, fov: Tensor, matsize: Tensor, device: Device = torch.device("cpu"), dir: Path | None = None, samp_dim: int = 0, spat_dim: int = 3):
         r"""
             Initializes a RawData Object.
 
@@ -328,6 +329,7 @@ class RawData:
         r"""
             Internal Method to load a Kspace Trajectory from 'kviews*.txt' and 'ktraj*.txt'
         """
+        # TODO: Handle Arms.
         # Load Data
         ktraj = np.loadtxt(kt_path)     # Kspace locations for each echo (before rotation) ---------------  [ns, 3]
         kviews = np.loadtxt(kv_path)    # Views File Data (Info about each echo's rotations and offsets) -  [ne x nf, 14]
@@ -760,10 +762,6 @@ class RawData:
     #####################################################################################
     #   Coil Sensetivity Related Methods                                                #
     #####################################################################################
-
-    def estimate_smaps(self, device) -> Smaps:
-        y = deepcopy(self).to(device).coilwise()
-
     def coil_compress(self, smap: Smaps) -> Self:
         r"""
             Do coil compression on a sensetivity map and our raw data
@@ -775,12 +773,62 @@ class RawData:
         
         return self
 
+    def coil_mean(self) -> Self:
+        r"""
+            Method that reshapes the data so that the coil mean coil image is reconstructed.
+            (treats each coil like a view)
+        """
+        raise NotImplementedError("TODO")
+
+
+    #####################################################################################
+    #   recoon3dflex features                                                           #
+    #####################################################################################
+    def k0correct(self, mode) -> Self:
+        r"""
+            Method that uses navigator data for different normalizations for each frame.
+            So:
+                out.data[:, k, i, j] = in.data[:, k, i, j] * S[k, i, j] 
+                forall ints k, i, j in [0, ne) x [0, nf) x [0, nc)
+
+            Where:
+                mode == 1:
+                    S[k, i, j] = mean_k(in.data[navs, k, i, j]) / in.data[navs, k, i, j]
+                mode == 2 (Phase Only):
+                    S[k, i, j] = exp(i * angle(mean_k(in.data[navs, k, i, j]) / in.data[navs, k, i, j]))
+                else: 
+                    Do Nothing
+
+            mean_k() denotes taking the mean over index k
+            navs are the indices of navigator points
+        """
+        if mode not in (1, 2):
+            return self
+
+        # Number of nav points
+        # This code finds the first kr value above a thershold and takes the minimum along all echos and frames
+        kr = torch.norm(self.traj, 2, -1)
+        nnav = (kr > 1e-6).any(dim=0).int().argmax(dim=0).min().item()
+
+        nav_data = self.data[0:nnav, :, :, :]
+        means = torch.mean(nav_data, dim=0)     # Mean of navigators for each echo [ne, nf, nc]
+        baseline = torch.mean(means, dim=0)     # Baseline (Mean over all views in coil and frame) [nf, nc]
+
+        if mode == 2:
+            # Just use the phase
+            means = torch.exp(1j * torch.angle(means))
+            baseline = torch.exp(1j * torch.angle(baseline))
+
+        S = baseline[None, :, :] / means
+        self.data *= S[None, :, :, :]
+
+        return self
+
 
 
     #####################################################################################
     #   Density Compensation Factor Estimation                                          #
     #####################################################################################
-
     def get_dcf(self, max_iter: int = 15, device=None) -> Tensor:
         r"""
             Estimate a density compensation tensowr w from the current kspace trajectory
@@ -788,6 +836,16 @@ class RawData:
         device = self.device if device is None else device
         self.printv(blu("DCF CALCULATION") + "...", end="")
         w, t = timed(lambda: self._get_dcf(max_iter, device), device)
+        self.printv(grn(" DONE!") + f"  :  [ took {t:.2f} s , VRAM aloc {(torch.cuda.memory_allocated()/(1024 ** 3)):.4f} GiB ]")
+        return w
+
+    def get_dcf_test(self, max_iter: int = 15, device=None) -> Tensor:
+        r"""
+            Estimate a density compensation tensowr w from the current kspace trajectory
+        """
+        device = self.device if device is None else device
+        self.printv(blu("DCF CALCULATION") + "...", end="")
+        w, t = timed(lambda: self._get_dcf_test(max_iter, device), device)
         self.printv(grn(" DONE!") + f"  :  [ took {t:.2f} s , VRAM aloc {(torch.cuda.memory_allocated()/(1024 ** 3)):.4f} GiB ]")
         return w
 
@@ -812,6 +870,32 @@ class RawData:
             w = torch.real(w / (Af * Af.H * w)).to(self._data_type)
 
         del Af, s
+        clr_mem()
+
+        # Normalize and return
+        return w / torch.linalg.norm(w)
+
+    def _get_dcf_test(self, max_iter: int = 15, device=None) -> Tensor:
+        r"""
+            Estimate a density compensation tensowr w from the current kspace trajectory
+        """
+        # TODO: check if MIRT shape
+        # TODO: Run Power Iter on AhA not AAh (if possible... idk)
+
+        # Check Device
+        if device is None: device = self.device
+
+        # Object Instantiation
+        w = torch.full_like(self.traj[:, 0, :], 1.0, dtype=self._data_type, device=device).unsqueeze(1)     # Weight Tensor (w_1 = vec(1))
+        A = NuFFT(self.matsize, self.traj).to(device)
+
+        # Run Pipe Mennone DCF Algorithm
+        for _ in range(max_iter):
+            # TODO: Termination Criteria
+            w = torch.real(w / (A * A.H * w)).to(self._data_type)
+
+        del A
+        w = w.to(self.device)
         clr_mem()
 
         # Normalize and return
@@ -876,11 +960,154 @@ class RawData:
 
 
     #####################################################################################
-    #   Conjugate Gradient Descent Image Reconstruction                                 #
+    #   SENSE Conjugate Gradient Descent Image Reconstruction                           #
     #####################################################################################
     # TODO: Fix Print statements in verbose mode
 
-    def _recon_CG_batch(self, smap: Smaps, reg: Number, w: Tensor | None = None, device: Device | None = None, max_iter: int = 500, soln_pref = "") -> Tensor:
+    def _CG_batch(self, reg: Number, w: Tensor | None = None, device: Device | None = None, max_iter: int = 500, soln_pref = "") -> Tensor:
+        r"""
+            Do a batched CG Reconstruction of the data using Conjugate Gradient Descent
+
+                x = argmin_x 1/2 |Ax - y|_2^2 + reg/2 |x|_2^2
+
+            by finding x s.t.:
+
+                A'(Ax - y) + reg x = 0
+        """
+        self.printv(blu("BATCH RECON") + "... ", end="")
+
+        # Set Device
+        device = self.device if device is None else device
+
+        # Set Tensor Shapes that MIRTorch expects
+        if self.mirt_shape:
+            y = deepcopy(self)
+        else:
+            y = deepcopy(self.set_mirt_shape())
+
+        # Make LinearMaps for the forward model and gradient
+        A = NuFFT(y.matsize, y.traj.to("cpu").repeat((y.data.shape[0],)+tuple([1] * len(y.traj.shape[1:]))), sequential=True).to(device)
+        AhA = NuFFTGram(y.matsize, y.traj.to("cpu").repeat((y.data.shape[0],)+tuple([1] * len(y.traj.shape[1:])))).to(device)
+        R = Identity(A.size_in).to(device)
+
+        AHy = A.H * y.data.to(device)
+
+        x0 = y._get_scaled_init(A, AhA, AHy, w, device)
+
+        x, t = timed(
+            lambda: CG(
+                AhA + reg * R,
+                alert=True,
+                max_iter=max_iter,
+                eval_func= lambda res: (torch.linalg.norm(res)).item()
+            ).run(x0, AHy, return_info=True),
+            device
+        )
+
+        self.print_solnv(x, t, res_scl=torch.linalg.norm(y.data), pref=soln_pref)
+
+        del A, AhA, R, x0, AHy
+        clr_mem()
+
+        return x.solution.squeeze(1)
+
+    def _CG_framewise(self, reg: Number, w: Tensor | None = None, device: Device | None = None, max_iter: int = 500) -> Tensor:
+        r"""
+            Do a framewise CG Reconstruction of the data
+        """
+        self.printv(blu("FRAME RECON") + "... ")
+
+        # Set Device
+        device = self.device if device is None else device
+
+        # Set Tensor Shapes that MIRTorch expects
+        if self.mirt_shape:
+            y = deepcopy(self)
+        else:
+            y = deepcopy(self.set_mirt_shape())
+
+        nf = y.data.shape[0]
+        x_img = torch.zeros((nf,) + tuple(self.matsize), dtype=self._data_type, device=device)
+
+        # Loop over all frames
+        for i in range(nf):
+            self.printv(maj("FRAME: ") + blu(f"{i} "), end="")
+            y_i = y[i, :, :]
+
+            # Instantiate Operators
+            A = NuFFT(y.matsize, y.traj.to("cpu"), batchmode=False).to(device)
+            AhA = NuFFTGram(y.matsize, y.traj.to("cpu")).to(device)
+            R = Identity(A.size_in).to(device)
+
+            # Precompute A'y
+            AHy = A.H * y_i.data.to(device)
+
+            # Get Initialization
+            x0 = y_i._get_scaled_init(A, AhA, AHy, w[i, :, :], device)
+
+            # Perform L2 regularized CG
+            x, t = timed(
+                lambda: CG(
+                    AhA + reg * R,
+                    alert=True,
+                    max_iter=max_iter,
+                    eval_func= lambda res: (torch.linalg.norm(res)).item()
+                ).run(x0, AHy, return_info=True),
+                device
+            )
+
+            # Store solution and log metrics
+            self.print_solnv(x, t, res_scl=torch.linalg.norm(y_i.data))
+            x_img[i, :, :, :] = x.solution
+
+            # Clear some old stuff
+            del A, AhA, R, x0, AHy, x
+            clr_mem()
+
+        return x_img
+
+    def _CG_trybatch(self, reg: Number, w: Tensor | None = None, device: Device | None = None, max_iter: int = 500) -> tuple[Tensor, bool]:
+        try:
+            self.printv(blu("TRYING "), end="")
+            return self._CG_batch(reg, w, device, max_iter), True
+        except:
+            # TODO: Better Error Handling for this (Catch OOM, not other stuff)
+            self.printv(red("FAIL! "), end="")
+
+        x_img, t = timed(lambda: self._CG_framewise(reg, w, device, max_iter), device)
+        self.printv(maj(f"Total Time: ") + "[ " + blu(f"{t:.2f} s") + " ]")
+        return x_img, False
+
+
+    def recon_CG(self, reg: Number, w: Tensor | None = None, device: Device | None = None, max_iter: int = 500, batchmode: bool | None = None) -> tuple[Tensor, bool]:
+        # How are we handling batching?
+        if batchmode is None:
+            # If batchmode = None (DEFAULT CASE):
+            # We try to do batchmode (much faster), and if
+            # it fails (probably OOM) we retry the reconstruction framewise
+            return self._CG_trybatch(reg, w, device, max_iter)
+        if batchmode:
+            # If batchmode = True:
+            # We have specified that we want batching (even if it runs out of memory)
+            return self._CG_batch(reg, w, device, max_iter), True
+        if not batchmode:
+            # If batchmode = False:
+            # We have specified that we want to reconstruct frame by frame (slower but more memory efficient)
+            x_img, t = timed(lambda: self._CG_framewise(reg, w, device, max_iter), device)
+            self.printv(maj(f"Total Time: ") + "[ " + blu(f"{t:.2f} s") + " ]")
+            return x_img, False
+
+        # If we get here, betchmode was invalid
+        raise ValueError("Invalid batchmode for RawData.recon_CG()")
+
+
+
+    #####################################################################################
+    #   SENSE Conjugate Gradient Descent Image Reconstruction                           #
+    #####################################################################################
+    # TODO: Fix Print statements in verbose mode
+
+    def _CGSENSE_batch(self, smap: Smaps, reg: Number, w: Tensor | None = None, device: Device | None = None, max_iter: int = 500, soln_pref = "") -> Tensor:
         r"""
             Do a batched CG Reconstruction of the data using Conjugate Gradient Descent
 
@@ -927,7 +1154,7 @@ class RawData:
 
         return x.solution.squeeze(1)
 
-    def _recon_CG_framewise(self, smap: Smaps, reg: Number, w: Tensor | None = None, device: Device | None = None, max_iter: int = 500) -> Tensor:
+    def _CGSENSE_framewise(self, smap: Smaps, reg: Number, w: Tensor | None = None, device: Device | None = None, max_iter: int = 500) -> Tensor:
         r"""
             Do a framewise CG Reconstruction of the data
         """
@@ -982,39 +1209,39 @@ class RawData:
 
         return x_img
 
-    def _recon_CG_trybatch(self, smap: Smaps, reg: Number, w: Tensor | None = None, device: Device | None = None, max_iter: int = 500) -> tuple[Tensor, bool]:
+    def _CGSENSE_trybatch(self, smap: Smaps, reg: Number, w: Tensor | None = None, device: Device | None = None, max_iter: int = 500) -> tuple[Tensor, bool]:
         try:
             self.printv(blu("TRYING "), end="")
-            return self._recon_CG_batch(smap, reg, w, device, max_iter), True
+            return self._CGSENSE_batch(smap, reg, w, device, max_iter), True
         except:
             # TODO: Better Error Handling for this (Catch OOM, not other stuff)
             self.printv(red("FAIL! "), end="")
 
-        x_img, t = timed(lambda: self._recon_CG_framewise(smap, reg, w, device, max_iter), device)
+        x_img, t = timed(lambda: self._CGSENSE_framewise(smap, reg, w, device, max_iter), device)
         self.printv(maj(f"Total Time: ") + "[ " + blu(f"{t:.2f} s") + " ]")
         return x_img, False
 
 
-    def recon_CG(self, smap: Smaps, reg: Number, w: Tensor | None = None, device: Device | None = None, max_iter: int = 500, batchmode: bool | None = None) -> tuple[Tensor, bool]:
+    def recon_CGSENSE(self, smap: Smaps, reg: Number, w: Tensor | None = None, device: Device | None = None, max_iter: int = 500, batchmode: bool | None = None) -> tuple[Tensor, bool]:
         # How are we handling batching?
         if batchmode is None:
             # If batchmode = None (DEFAULT CASE):
             # We try to do batchmode (much faster), and if
             # it fails (probably OOM) we retry the reconstruction framewise
-            return self._recon_CG_trybatch(smap, reg, w, device, max_iter)
+            return self._CGSENSE_trybatch(smap, reg, w, device, max_iter)
         if batchmode:
             # If batchmode = True:
             # We have specified that we want batching (even if it runs out of memory)
-            return self._recon_CG_batch(smap, reg, w, device, max_iter), True
+            return self._CGSENSE_batch(smap, reg, w, device, max_iter), True
         if not batchmode:
             # If batchmode = False:
             # We have specified that we want to reconstruct frame by frame (slower but more memory efficient)
-            x_img, t = timed(lambda: self._recon_CG_framewise(smap, reg, w, device, max_iter), device)
+            x_img, t = timed(lambda: self._CGSENSE_framewise(smap, reg, w, device, max_iter), device)
             self.printv(maj(f"Total Time: ") + "[ " + blu(f"{t:.2f} s") + " ]")
             return x_img, False
 
         # If we get here, betchmode was invalid
-        raise ValueError("Invalid batchmode for RawData.recon_CG()")
+        raise ValueError("Invalid batchmode for RawData.recon_CGSENSE()")
 
 
 

@@ -16,12 +16,9 @@ verbose = True  # Print output stuff?
 device = best_available_device(verbose=True)
 torch.manual_seed(0)
 
-# Instantiate FSLViewer
-viewer = FSLViewer(halted=(not disp))
-
 # Load Data
 RawData.set_verbose(verbose)
-y = RawData.from_dir("/home/clouly/DEV/asldata/20260731/asldata_*smap*", verbose=True)
+y = RawData.from_dir("/home/clouly/DEV/asldata/20261104/asldata_smap*")
 
 # Make Smap Dir
 #   For my workflow, they live in the parent of the data directory.
@@ -30,8 +27,14 @@ y = RawData.from_dir("/home/clouly/DEV/asldata/20260731/asldata_*smap*", verbose
 smap_dir = y.dir.parent / 'smaps'
 smap_dir.mkdir(exist_ok=True)
 
+# Instantiate FSLViewer
+viewer = FSLViewer(halted=(not disp), save_dir=smap_dir)
+
 # Clip off some navigator data
-y = y.initial_clip()
+y = y.initial_clip().coilwise()
+
+# Get Density Compensation Factor
+w = y.get_dcf()
 
 # Get Smaps
 # TODO: Write ESPIRIT alg (or find existing) to finish this script

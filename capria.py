@@ -6,7 +6,7 @@ from copy import deepcopy
 import torch
 
 # Flags
-disp = False     # Display Images?
+disp = True     # Display Images?
 save = True     # Save Images?
 verbose = True  # Are we printing
 
@@ -17,30 +17,38 @@ RawData.set_verbose(verbose)
 
 # Reconstruction constnts
 ccfac = 4
-reg = 1
+usf=1
+reg = 1/usf
 max_iter = 500
-wsizes = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-#wsizes = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-#wsizes = [20]
+wsizes = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+wsizes = [1]
+#wsizes = [16, 17, 18, 19, 20]
 #wsizes = [10, 11, 12, 13, 14, 15]
 atol = 0.0
 rtol = 10**-6
 
 # Load in the Sensetivity Maps and setup the FSL viewer
-smap = Smaps.load("/home/clouly/DEV/asldata/20260731/smaps/grey_64_smap.mat", cdim=-1, dtype=torch.complex64, device="cpu").compress(ccfac)
+smap_mag = Smaps.load("/home/clouly/DEV/asldata/20261104/asldata_smap/smap_mag.nii.gz", cdim=-1, dtype=torch.complex64, device="cpu").get_tensor()
+smap_ang = Smaps.load("/home/clouly/DEV/asldata/20261104/asldata_smap/smap_ang.nii.gz", cdim=-1, dtype=torch.complex64, device="cpu").get_tensor()
+smap = Smaps._from_tensors(smap_mag * torch.exp(1j * smap_ang), None).compress(ccfac=8)
 viewer = FSLViewer(halted=(not disp))
 viewer.add_smap(smap)
 
+print(smap.shape)
+
 # Start loading data
-for y_raw in RawData.from_glob("/home/clouly/DEV/asldata/20260731/asldata_look*"):
+for y_raw in RawData.from_glob("/home/clouly/DEV/asldata/20261104/asldata_look*"):
     print(y_raw)
     viewer.set_save_dir(str(y_raw.dir))
 
     # Make directories
     if save:
-        l_path = y_raw.dir / "label"
-        c_path = y_raw.dir / "control"
-        s_path = y_raw.dir / "subtraction"
+        # l_path = y_raw.dir / f"label_usf{usf}_notransp"
+        # c_path = y_raw.dir / f"control_usf{usf}_notransp"
+        # s_path = y_raw.dir / f"subtraction_usf{usf}_notransp"
+        l_path = y_raw.dir / f"label_usf{usf}"
+        c_path = y_raw.dir / f"control_usf{usf}"
+        s_path = y_raw.dir / f"subtraction_usf{usf}"
         l_path.mkdir(exist_ok=True)
         c_path.mkdir(exist_ok=True)
         s_path.mkdir(exist_ok=True)
@@ -51,6 +59,9 @@ for y_raw in RawData.from_glob("/home/clouly/DEV/asldata/20260731/asldata_look*"
     #   - Swap echos for frames
     #   - Separate out control and label 
     yl_raw, yc_raw = y_raw.initial_clip().coil_compress(smap).swapdims(1, 2).split_cl(dim=1)
+    #yl_raw, yc_raw = y_raw.initial_clip().coil_compress(smap).split_cl(dim=2)
+    yl_raw = yl_raw[:, ::usf, :, :]
+    yc_raw = yc_raw[:, ::usf, :, :]
 
     # The first time the batch recon fails, we stop trying.
     # This is because as window size increases, we use more memory, 
@@ -74,7 +85,7 @@ for y_raw in RawData.from_glob("/home/clouly/DEV/asldata/20260731/asldata_look*"
 
         # Label Recon
         print(cya("LABEL: "), end="")
-        xl_img, bf = ylw.recon_CG(smap, reg, w, device, max_iter, batchmode=batch_flag)
+        xl_img, bf = ylw.recon_CGSENSE(smap, reg, w, device, max_iter, batchmode=batch_flag)
         if bf == False: batch_flag = False  # If batchmode failed, we dont try again (for this data directory)
         del ylw
         clr_mem()
@@ -85,7 +96,7 @@ for y_raw in RawData.from_glob("/home/clouly/DEV/asldata/20260731/asldata_look*"
 
         # Control Recon
         print(cya("CNTRL: "), end="")
-        xc_img, _ = ycw.recon_CG(smap, reg, w, device, max_iter, batchmode=batch_flag)
+        xc_img, _ = ycw.recon_CGSENSE(smap, reg, w, device, max_iter, batchmode=batch_flag)
         if bf == False: batch_flag = False  # If batchmode failed, we dont try again (for this data directory)
         del ycw, w
         clr_mem()
