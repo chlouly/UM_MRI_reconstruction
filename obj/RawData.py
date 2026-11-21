@@ -136,7 +136,6 @@ class RawData:
         self.dir=dir
         self.samp_dim = samp_dim
         self.spat_dim = spat_dim
-        self.ns = self.data.shape[self.samp_dim]
         self.mirt_shape = False
 
     @classmethod
@@ -336,22 +335,51 @@ class RawData:
                                         #       Each entry stores: [armn, shotn, echon, rz, dz, R[:]]
         nv = kviews.shape[0]
 
-        # Get Number of Echos
-        bof = np.argwhere(kviews[:, 2].astype(int).squeeze() == 0)
-        ne = nv if bof.size == 1 else next((n.item() for n in bof if n != 0), -1)
-        nf = int(nv / ne)
+        # # Get Number of Echos
+        # bof = np.argwhere(kviews[:, 2].astype(int).squeeze() == 0)
+        # ne = nv if bof.size == 1 else next((n.item() for n in bof if n != 0), -1)
+        # nf = int(nv / ne)
+
+        # # Get Number of arms
+        # bof = np.argwhere(kviews[:, 0].astype(int).squeeze() == 0)
+        # na = nv if bof.size == 1 else next((n.item() for n in bof if n != 0), -1)
+
+        # REPLACEMENT
+        na = np.max(kviews[:, 0].astype(int)) + 1
+        ns = np.max(kviews[:, 1].astype(int)) + 1
+        ne = np.max(kviews[:, 2].astype(int)) + 1
+        nf = nv // (na * ns * ne)
 
         # Check if the number of echos and frames makes sense
-        if ne == -1:
-            raise ValueError(f"Kviews file seems to be formatted incorrectly.")
-        elif ne * nf != nv:
+        if na * ns * ne * nf != nv:
             raise ValueError(f"Kviews file at '{str(kv_path)}' has an irregular number of echos per frame.")
 
-        # Get Rotation Matrices
-        R = kviews[:, -9:].reshape((nf, ne, 3, 3))
+        # # Get Rotation Matrices
+        # R = kviews[:, -9:].reshape((nf, ne, 3, 3))
 
+        # Get Rotation Matrices
+        R = kviews[:, -9:].reshape((nv, 3, 3))
+        # tst = torch.from_numpy(kviews[:, :3].astype(int))
+
+        # Trajectory [ns, ne, nf, na, ]
+        traj = torch.from_numpy(np.einsum('njk,lk->lnj', R, ktraj))
+        traj = traj.unflatten(dim=1, sizes=(nf, na, ns, ne))
+        # tst = tst.unflatten(dim=0, sizes=(nf, na, ns, ne))
+
+        # print((nf, na, ns, ne))
+        # print("na * ns * ne = ", na * ns * ne)
+        # print()
+        # print("F: ", (tst.diff(n=1, dim=0) != 0).any())
+        # print("A: ", (tst.diff(n=1, dim=1)[:,:,:,:,0] != 1).any())
+        # print("S: ", (tst.diff(n=1, dim=2)[:,:,:,:,1] != 1).any())
+        # print("E: ", (tst.diff(n=1, dim=3)[:,:,:,:,2] != 1).any())
+
+        traj = traj.flatten(start_dim=2, end_dim=4).swapdims(1,2)
+
+        print(traj.shape)
         # Compute Kspace Trajectory and return it
-        return torch.from_numpy(np.einsum('nmjk,lk->lnmj', R, ktraj)).swapdims(1,2)
+        # return torch.from_numpy(np.einsum('nmjk,lk->lnmj', R, ktraj)).swapdims(1,2)
+        return traj
 
     @staticmethod
     def _scale_traj(traj: Tensor, fov: Tensor, matsize: Tensor) -> Tensor:
@@ -368,9 +396,6 @@ class RawData:
         self.device = device
         return self
 
-    def img_dims(self):
-        return tuple(self.matsize.tolist())
-
     @classmethod
     def set_verbose(cls, verbose: bool = True):
         r"""Set verbose?"""
@@ -384,7 +409,44 @@ class RawData:
         r"""Print only if verbose flag is enabled"""
         if self.verbose: print_soln(*args, **kwargs)
 
+    @property
+    def shape(self):
+        """Returns the shape of our kspace data"""
+        return self.data.shape
 
+    @property
+    def ns(self):
+        """Returns the number of kspace samples per view"""
+        if self.mirt_shape:
+            return self.shape[2]
+        else:
+            return self.shape[0]
+
+    @property
+    def nf(self):
+        """Returns the number of frames in this kspace dataset"""
+        if self.mirt_shape:
+            return self.shape[0]
+        else:
+            return self.shape[1]
+
+    @property
+    def ne(self):
+        """Returns the number of echos in this kspace dataset"""
+        return self.shape[2]
+
+    @property
+    def nc(self):
+        """Returns the number of coils in this kspace dataset"""
+        if self.mirt_shape:
+            return self.shape[0]
+        else:
+            return self.shape[3]
+
+    def img_dims(self):
+        return tuple(self.matsize.tolist())
+
+    
     
     #####################################################################################
     #   OPERATOR OVERLOAD                                                               #
@@ -676,6 +738,11 @@ class RawData:
         self.mirt_shape = True
         self.spat_dim = 1
         self.samp_dim = 2
+        ex_dims = tuple(
+            -1 if t == d or t != 1 else d
+            for d, t in zip(self.data.shape, self.traj.shape)
+        )
+        self.traj = self.traj.expand(*ex_dims)
         return self.movedim(-1, 0).flatten(1, 2).movedim(-1, 0)
 
     def coilwise(self) -> Self:
@@ -688,8 +755,10 @@ class RawData:
         """
         self.data = self.data.unsqueeze(4)
         self.traj = self.traj.unsqueeze(3)
+        self = self.flatten(1, 2)
+        self.traj = self.traj.expand(-1, -1, self.data.shape[2], -1)
 
-        return self.flatten(1, 2)
+        return self
 
     def split_cl(self, dim: int = 2, mode=1) -> tuple[Self | None, Self | None]:
         r"""
@@ -773,16 +842,9 @@ class RawData:
         
         return self
 
-    def coil_mean(self) -> Self:
-        r"""
-            Method that reshapes the data so that the coil mean coil image is reconstructed.
-            (treats each coil like a view)
-        """
-        raise NotImplementedError("TODO")
-
 
     #####################################################################################
-    #   recoon3dflex features                                                           #
+    #   recon3dflex features                                                            #
     #####################################################################################
     def k0correct(self, mode) -> Self:
         r"""
@@ -823,6 +885,12 @@ class RawData:
         self.data *= S[None, :, :, :]
 
         return self
+
+    def aqdel(self, delay) -> Self:
+        if delay == 0:
+            return self
+
+        raise NotImplementedError("RawData.aqdel() not yet implemented")
 
 
 
@@ -1173,9 +1241,9 @@ class RawData:
         x_img = torch.zeros((nf,) + tuple(self.matsize), dtype=self._data_type, device=device)
 
         # Loop over all frames
-        for i in range(nf):
+        for i in range(y.nf):
             self.printv(maj("FRAME: ") + blu(f"{i} "), end="")
-            y_i = y[i, :, :]
+            y_i = deepcopy(y)[i, :, :]
 
             # Instantiate Operators
             A = NuSense(smap.get_tensor().to("cpu"), y_i.traj.to("cpu"), batchmode=False).to(device)

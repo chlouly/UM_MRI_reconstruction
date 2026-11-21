@@ -87,6 +87,10 @@ for y_raw in RawData.from_glob("/home/clouly/DEV/asldata/20261104/asldata_look*"
         print(cya("LABEL: "), end="")
         xl_img, bf = ylw.recon_CGSENSE(smap, reg, w, device, max_iter, batchmode=batch_flag)
         if bf == False: batch_flag = False  # If batchmode failed, we dont try again (for this data directory)
+        print(ylw.shape)
+        print(ylw.traj.shape)
+        print(smap.shape)
+        assert False
         del ylw
         clr_mem()
 
